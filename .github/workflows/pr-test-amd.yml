@@ -1018,7 +1018,7 @@ jobs:
             -e HF_HUB_ENABLE_HF_TRANSFER=1 \
             -e HF_HUB_DISABLE_SYMLINKS_WARNING=1 \
             -w /sglang-checkout/python \
-            ci_sglang python3 sglang/multimodal_gen/test/single_test_file/flux3_disagg_diag.py
+            ci_sglang python3 sglang/multimodal_gen/test/single_test_file/flux3_vae_determinism_diag.py
 
           # Post-test diagnostics
           echo "=== Post-test System Memory Status ==="
