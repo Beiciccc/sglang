@@ -1,7 +1,7 @@
 //! The shared handle: submission with admission and cancellation ownership,
 //! runtime-to-semantic event translation, and the typed control operations
-//! (model info, model list, server info, flush cache, weights check, tokenize,
-//! detokenize, health probe).
+//! (model info, model list, server info, flush cache, weights check, profiling,
+//! tokenize, detokenize, health probe).
 
 use std::collections::HashMap;
 use std::sync::{
@@ -16,7 +16,8 @@ use tokio::sync::{mpsc, oneshot};
 use crate::message::config::{DisaggregationMode, ServerArgs};
 use crate::message::ids::Rid;
 use crate::message::io_struct::{
-    CheckWeightsReqInput, ControlRequest, FlushCacheReqInput, GetInternalStateReq,
+    CheckWeightsReqInput, ControlRequest, FlushCacheReqInput, GetInternalStateReq, ProfileOptions,
+    ProfileReq,
 };
 use crate::message::request::{GenerateRequest, RenderedChat, Request, RequestKind, TokenizeInput};
 use crate::message::response::{ResponseItem, ResponseSink};
@@ -25,6 +26,7 @@ use crate::message::types::TokenIds;
 use crate::multi_modality::worker::{MediaError, MmProcessor};
 use crate::tokenizer_manager::from_scheduler::ActivityCounter;
 use crate::tokenizer_manager::wiring::{AbortSource, RequestAdmission, TmEvent};
+use crate::utils::environ;
 use crate::utils::error::Error;
 use crate::utils::fsm::RequestState;
 
@@ -406,6 +408,35 @@ impl CoreHandle {
             .await?;
         rmp_serde::from_slice::<CheckWeightsOutcome>(&bytes).map_err(|error| {
             CoreError::InvalidResponse(format!("invalid weights-check response: {error}"))
+        })
+    }
+
+    /// Ask the scheduler ranks to start profiling (which ranks under
+    /// attention DP: see `ProfileReq`), resolving `options` as
+    /// Python's `TokenizerManager.start_profile` does (see
+    /// [`resolve_start_profile`]).
+    pub(crate) async fn start_profile(
+        &self,
+        options: ProfileOptions,
+    ) -> Result<ProfileOutcome, CoreError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        let options = resolve_start_profile(options, environ::get_bool_env_var, now);
+        self.profile(ProfileReq::start(Rid::new().to_string(), options))
+            .await
+    }
+
+    /// Ask the scheduler ranks to stop profiling and write their traces.
+    pub(crate) async fn stop_profile(&self) -> Result<ProfileOutcome, CoreError> {
+        self.profile(ProfileReq::stop(Rid::new().to_string())).await
+    }
+
+    async fn profile(&self, request: ProfileReq) -> Result<ProfileOutcome, CoreError> {
+        let bytes = self.control(ControlRequest::ProfileReq(request)).await?;
+        rmp_serde::from_slice::<ProfileOutcome>(&bytes).map_err(|error| {
+            CoreError::InvalidResponse(format!("invalid profile response: {error}"))
         })
     }
 
@@ -834,6 +865,38 @@ pub(crate) struct FlushCacheOutcome {
     pub(crate) success: bool,
     #[serde(default)]
     pub(crate) message: String,
+}
+
+/// The scheduler's `ProfileReqOutput`: whether the profiler call succeeded,
+/// and why not.
+#[derive(Debug, serde::Deserialize, PartialEq)]
+pub(crate) struct ProfileOutcome {
+    pub(crate) success: bool,
+    #[serde(default)]
+    pub(crate) message: String,
+}
+
+/// Python's `TokenizerManager.start_profile` defaults: stacks and shapes are
+/// recorded unless the body or `SGLANG_PROFILE_WITH_STACK` /
+/// `SGLANG_PROFILE_RECORD_SHAPES` (read by `env_flag`, default true) turns
+/// them off, and a missing or empty `profile_id` becomes `str(time.time())`
+/// (`now`, in seconds) — the trace file name prefix.
+fn resolve_start_profile(
+    mut options: ProfileOptions,
+    env_flag: impl Fn(&str, bool) -> bool,
+    now: f64,
+) -> ProfileOptions {
+    options.with_stack =
+        Some(options.with_stack != Some(false) && env_flag("SGLANG_PROFILE_WITH_STACK", true));
+    options.record_shapes = Some(
+        options.record_shapes != Some(false) && env_flag("SGLANG_PROFILE_RECORD_SHAPES", true),
+    );
+    if options.profile_id.as_deref().is_none_or(str::is_empty) {
+        // `{:?}` prints the shortest round-trip form with a fractional part,
+        // as Python's `str(float)` does.
+        options.profile_id = Some(format!("{now:?}"));
+    }
+    options
 }
 
 /// The scheduler's `CheckWeightsReqOutput`: whether every rank succeeded, why
@@ -1764,6 +1827,52 @@ mod tests {
             .unwrap();
         assert_eq!(task.await.unwrap().unwrap(), Bytes::from_static(b"payload"));
         assert!(harness.abort_rx.try_recv().is_err());
+    }
+
+    /// `start_profile` resolves the body as Python's
+    /// `TokenizerManager.start_profile`: a body `false` or an env knob not
+    /// `true`/`1` turns stacks/shapes off, and a missing or empty
+    /// `profile_id` becomes `str(time.time())`.
+    #[test]
+    fn start_profile_resolves_python_defaults() {
+        for (body, env, want) in [
+            (None, None, true),
+            (Some(true), None, true),
+            (Some(false), None, false),
+            (None, Some(false), false),
+            (Some(true), Some(false), false),
+        ] {
+            let resolved = resolve_start_profile(
+                ProfileOptions {
+                    with_stack: body,
+                    record_shapes: body,
+                    ..Default::default()
+                },
+                |name, default| {
+                    assert!(default, "{name} defaults to true");
+                    env.unwrap_or(default)
+                },
+                1.0,
+            );
+            assert_eq!(resolved.with_stack, Some(want), "{body:?} {env:?}");
+            assert_eq!(resolved.record_shapes, Some(want), "{body:?} {env:?}");
+        }
+
+        for (profile_id, now, want) in [
+            (None, 1729771234.0, "1729771234.0"),
+            (Some(""), 1729771234.5678904, "1729771234.5678904"),
+            (Some("run-1"), 1.0, "run-1"),
+        ] {
+            let resolved = resolve_start_profile(
+                ProfileOptions {
+                    profile_id: profile_id.map(str::to_owned),
+                    ..Default::default()
+                },
+                |_, default| default,
+                now,
+            );
+            assert_eq!(resolved.profile_id.as_deref(), Some(want));
+        }
     }
 
     #[tokio::test]

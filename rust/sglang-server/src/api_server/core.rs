@@ -19,6 +19,8 @@ pub(crate) use error::{CoreError, CoreErrorKind};
 #[cfg(test)]
 pub(crate) use frame::frame_metadata_case;
 pub(crate) use frame::{CoreEvent, CoreOutput, HealthStatus};
-pub(crate) use handle::{CoreCall, CoreConfig, CoreHandle, CoreMetadata, recv_indexed};
+pub(crate) use handle::{
+    CoreCall, CoreConfig, CoreHandle, CoreMetadata, ProfileOutcome, recv_indexed,
+};
 pub(crate) use hicache::HiCacheManager;
 pub(crate) use metrics::{FLUSH_INTERVAL, FrontendMetrics};
