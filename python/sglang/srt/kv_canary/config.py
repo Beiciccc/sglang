@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
@@ -18,6 +19,20 @@ class CanaryMode(str, Enum):
     NONE = "none"
     LOG = "log"
     RAISE = "raise"
+
+
+def _parse_canary_mode() -> CanaryMode:
+    mode_raw = get_observability().kv_canary.strip().lower()
+    if mode_raw not in ("none", "log", "raise"):
+        raise ValueError(
+            f"kv-canary: kv_canary must be one of none/log/raise, got {mode_raw!r}"
+        )
+    return CanaryMode(mode_raw)
+
+
+@functools.cache
+def kv_canary_mode() -> CanaryMode:
+    return _parse_canary_mode()
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -62,16 +77,10 @@ class CanaryConfig:
 
     @classmethod
     def from_env(cls, server_args: ServerArgs) -> CanaryConfig:
-        mode_raw = get_observability().kv_canary.strip().lower()
-        if mode_raw not in ("none", "log", "raise"):
-            raise ValueError(
-                f"kv-canary: kv_canary must be one of none/log/raise, got {mode_raw!r}"
-            )
-
         real_kv_raw = get_observability().kv_canary_real_data.strip().upper()
 
         return cls(
-            mode=CanaryMode(mode_raw),
+            mode=_parse_canary_mode(),
             ring_capacity=envs.SGLANG_KV_CANARY_RING_CAPACITY.get(),
             sweep_interval=get_observability().kv_canary_sweep_interval,
             real_kv_hash_mode=RealKvHashMode[real_kv_raw],

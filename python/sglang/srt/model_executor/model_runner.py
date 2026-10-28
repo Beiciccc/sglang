@@ -2214,6 +2214,12 @@ class ModelRunner:
                 observer_state,
                 next_token_ids,
             )
+        if (c := self.canary_manager) is not None:
+            c.on_sampled(
+                logits_output=logits_output,
+                forward_batch=forward_batch,
+                next_token_ids=next_token_ids,
+            )
         self.ngram_embedding_manager.update_after_decode(
             next_token_ids=next_token_ids,
             forward_batch=forward_batch,

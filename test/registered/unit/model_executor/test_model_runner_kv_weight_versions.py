@@ -146,7 +146,10 @@ def test_eagle_post_verify_graph_preserves_kv_provenance() -> None:
     )
     tokens = torch.tensor([1])
     post = (tokens, tokens, tokens, tokens, tokens, None)
-    target_worker = SimpleNamespace(forward_batch_generation=lambda **_: output)
+    target_worker = SimpleNamespace(
+        forward_batch_generation=lambda **_: output,
+        model_runner=SimpleNamespace(canary_manager=None),
+    )
 
     with (
         patch.object(eagle_worker_common, "record_stream_for_v2_verify"),
