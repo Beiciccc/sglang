@@ -67,6 +67,61 @@ from sglang.srt.environ import envs
 
 logger = init_logger(__name__)
 
+
+_DIAG_COUNTER = [0]
+
+
+def _diag(stage: str, batch, server_args=None, **values) -> None:
+    """Debug-only: dump tensors per stage when SGLANG_FLUX3_DIAG_DIR is set."""
+    root = os.environ.get("SGLANG_FLUX3_DIAG_DIR")
+    if not root:
+        return
+    tag = os.environ.get("SGLANG_FLUX3_DIAG_TAG", "untagged")
+    role = getattr(getattr(server_args, "disagg_role", None), "value", None) or str(
+        getattr(server_args, "disagg_role", "")
+    )
+    prompt = batch.prompt[0] if isinstance(batch.prompt, (list, tuple)) else batch.prompt
+    mode = "i2i" if batch.image_path else "t2i"
+    key = hashlib.sha1(f"{mode}|{prompt}".encode()).hexdigest()[:8]
+    _DIAG_COUNTER[0] += 1
+    out = {}
+
+    def flat(name, value):
+        if isinstance(value, Tensor):
+            t = value.detach().to("cpu").contiguous()
+            digest = hashlib.sha256(
+                t.reshape(-1).view(torch.uint8).numpy().tobytes()
+                if t.numel()
+                else b""
+            ).hexdigest()[:16]
+            out[name] = t.clone()
+            logger.info(
+                "[FLUX3DIAG] tag=%s role=%s stage=%s key=%s mode=%s name=%s "
+                "shape=%s dtype=%s sha=%s dev=%s",
+                tag, role, stage, key, mode, name, tuple(t.shape), t.dtype,
+                digest, value.device,
+            )
+        elif isinstance(value, (list, tuple)):
+            for i, v in enumerate(value):
+                flat(f"{name}.{i}", v)
+        elif isinstance(value, dict):
+            for k, v in value.items():
+                flat(f"{name}.{k}", v)
+        else:
+            logger.info(
+                "[FLUX3DIAG] tag=%s role=%s stage=%s key=%s mode=%s name=%s value=%r",
+                tag, role, stage, key, mode, name, value,
+            )
+
+    for name, value in values.items():
+        flat(name, value)
+    directory = Path(root) / tag
+    directory.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        out,
+        directory / f"{stage}_{key}_{os.getpid()}_{_DIAG_COUNTER[0]}.pt",
+    )
+
 DOWNSAMPLING_RATIO = 16
 
 MAX_REFERENCES = 10
@@ -560,6 +615,7 @@ class Flux3ImageTextEncodeStage(PipelineStage):
             ]
             if not batch.image_path:
                 batch.extra.update(flux3_condition=None, flux3_crop=None)
+            _diag("text", batch, server_args, text=batch.extra["flux3_text"])
         return batches
 
 
@@ -623,6 +679,15 @@ class Flux3ImageConditionEncodeStage(ConditionEncodingStage):
                     self.package_config.dit.image_rope_scale,
                     get_local_torch_device(),
                 )
+        _diag(
+            "cond",
+            batch,
+            server_args,
+            references=references,
+            condition=batch.extra["flux3_condition"],
+            crop=crop,
+            size=(width, height),
+        )
         return batch
 
 
@@ -761,6 +826,19 @@ class Flux3ImageDenoiseStage(DenoisingStage):
             ]
             for req in batches
         ]
+        for req, request_images in zip(batches, images):
+            _diag(
+                "denoise_in",
+                req,
+                server_args,
+                text=req.extra["flux3_text"],
+                condition=req.extra["flux3_condition"],
+                noise=[image for image, _ in request_images],
+                size=(req.width, req.height),
+                steps=steps,
+                seed=req.seed,
+                batch_size=len(batches),
+            )
         flow_map = self.package_config.dit.flow_map
         packed = pack(
             [
@@ -848,6 +926,7 @@ class Flux3ImageDenoiseStage(DenoisingStage):
         counts = [sum(image[0].shape[0] for image, _ in group) for group in images]
         for req, latent, group in zip(batches, latents.split(counts), images):
             req.latents, req.latent_ids = latent, group[0][1]
+            _diag("denoise_out", req, server_args, latents=latent, ids=group[0][1])
             if server_args.disagg_role == RoleType.DENOISER:
                 # The decoder needs latents and crop, not the encoding payload.
                 req.extra.pop("flux3_text", None)
@@ -898,6 +977,15 @@ class Flux3ImageDecodeStage(PipelineStage):
                     vae_decode(self.vae, batch.latents, batch.latent_ids, batched=True),
                     batch.extra["flux3_crop"],
                 )
+        _diag(
+            "decode",
+            batch,
+            server_args,
+            latents=batch.latents,
+            ids=batch.latent_ids,
+            image=image,
+            crop=batch.extra["flux3_crop"],
+        )
         return OutputBatch(output=self._to_display(image), metrics=batch.metrics)
 
     @torch.no_grad()
@@ -923,6 +1011,16 @@ class Flux3ImageDecodeStage(PipelineStage):
                     [req.num_outputs_per_prompt for _, req in group]
                 )
                 for (index, req), images in zip(group, decoded_groups):
+                    _diag(
+                        "decode",
+                        req,
+                        server_args,
+                        latents=req.latents,
+                        ids=req.latent_ids,
+                        image=images,
+                        crop=req.extra["flux3_crop"],
+                        group_size=len(group),
+                    )
                     outputs[index] = OutputBatch(
                         output=list(
                             self._to_display(
